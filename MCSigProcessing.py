@@ -1,18 +1,41 @@
 import numpy as np
-from scipy.fft import rfft, rfftfreq
 from scipy.signal import butter, sosfiltfilt, welch
 from pyOpenBCI import OpenBCICyton
 import time
 import serial
 import math
 
+#boards
 CYTON_PORT = '/dev/cu.usbserial-DP05IS0W'
 ESP_PORT = '/dev/cu.usbserial-0001'
+
+#conversion counts
 uVoltsConv = (4500000)/24/(2**23-1) #uV/count
 accelGConv = 0.002 / (2**4) #G/count
-epochChannelData = np.zeros((2, 128))
+
+#sample manipulation
+epochChannelData = np.zeros((2, 256))
 samplesInEpoch = 0
 sampleFreq = 250
+samplesPerEpoch = 256
+
+#exponential moving average
+alphaEMA = 0.05
+previous = 0
+appliedEMA = 0
+
+#calibration
+baseline = 0
+capacity = 0
+baselineSamples = []
+capacitySamples = []
+calibrationEpochs = 0
+
+#writing
+lastSteering = 0
+lastThrottle = 0
+
+allSamples = []
 
 #define bandpass filter. we care about theta (4-8 hz) and beta (12-40 hz), so the optimal passband range would be 4-40 hz.
 highPass = 4 
@@ -26,15 +49,52 @@ BANDPASS_SOS = butter(
   fs = sampleFreq
 )
 
-board = OpenBCICyton(port=CYTON_PORT, daisy=False, baud=115200, timeout=None, max_packets_skipped=1)
+board = OpenBCICyton(port=CYTON_PORT, daisy=False, baud=115200, timeout=None, max_packets_skipped=1) #initialize boards
 esp = serial.Serial(port=ESP_PORT)
-
 time.sleep(2)
 
-def handleSteering(sample):
+def calibrateRange(currentAttention):
+  global calibrationEpochs
+  global baseline, capacity, baselineSamples, capacitySamples
+  global previous, appliedEMA
 
-  if(sample.aux_data[0] == 0 and sample.aux_data[1] == 0 and sample.aux_data[2] == 0):
-    return
+  if (calibrationEpochs == 0):
+    input("press ENTER to start baseline calibration: ")
+    calibrationEpochs += 1
+    board.start_stream(throttle)
+  elif (calibrationEpochs < 4): #skip first 3 unreliable epochs
+    calibrationEpochs += 1
+  elif (calibrationEpochs < 63):
+    baselineSamples.append(currentAttention) #first minute - baseline
+    print(f"{currentAttention}")
+    calibrationEpochs += 1
+  elif (calibrationEpochs == 63):
+    board.stop_stream()
+    input("press ENTER to start capacity calibration: ")
+    calibrationEpochs += 1
+    appliedEMA = 0
+    board.start_stream(throttle)
+  elif (calibrationEpochs < 67): #skip first 3 unreliable epochs
+    calibrationEpochs += 1
+  elif (calibrationEpochs < 118):
+    capacitySamples.append(currentAttention) #1-2 minutes - capacity
+    print(f"{currentAttention}")
+    calibrationEpochs += 1
+  elif (calibrationEpochs == 118):
+    board.stop_stream()
+    baseline = min(baselineSamples) #set baseline and capacity values. set initial previous value to baseline as a starting point (needed for EMA)
+    previous = baseline
+    capacity = max(capacitySamples)
+    print(f"Baseline Measured: {baseline}")
+    print(f"Capacity Measured: {capacity}")
+    input("press ENTER to end calibration and begin racing")
+    calibrationEpochs += 1
+    board.start_stream(driveCar)
+
+def handleSteering(sample):
+  global lastSteering, lastThrottle
+  if(sample.aux_data[0] == 0 and sample.aux_data[1] == 0 and sample.aux_data[2] == 0): #quit if no accelerometer data available
+    return 
 
   accelX = sample.aux_data[0] * accelGConv #extract acceleration in x direction from sample packet
   accelX = max(-1.0, min(1.0, accelX)) #clamp values to range between -1 and 1 to pass arcsin function
@@ -48,41 +108,58 @@ def handleSteering(sample):
   elif (deg > 5):
     deg = (deg - 5) * 2
 
-  esp.write(f"{deg:.0f}\n".encode()) #write degree of tilt to ESP
+  deg = max(-90, min(deg, 90))
+  lastSteering = deg
+
+  esp.write(f"S{lastSteering:03.0f}T{lastThrottle:03.0f}\n".encode()) #write degree of tilt to ESP with last throttle value
 
 def throttle(sample):
-  #we need to segment into epochs to complete intensity vs time data, apply filters, and then extract features
-  global samplesInEpoch
-  global epochChannelData
-  convertedSample = np.array(sample.channels_data[0:2]) * uVoltsConv #convert sample packet data from byte values to units of microvolts. we only care about PFC for attention, which is why we're only taking fp1 and fp2 readings
-  attentionMetric = 0 #this will be what we write to the ESP
+  global allSamples
+  global samplesInEpoch, epochChannelData, samplesPerEpoch
+  global calibrationEpochs, baseline, capacity
+  global lastSteering, lastThrottle
 
-  #epoch segmentation - for smooth throttle control, we need 2 Hz updates at least, so roughly 500 ms long updates. Because our Cyton's 
-  #sampling rate is 250 Hz, we get 1 sample every 4 ms. 512 is a nice number near 500 divisible by 4, so we can use 512 ms as our epoch length.
-  #this gives us 128 samples per epoch (512 ms / 4 ms per 1 sample).
-  if (samplesInEpoch == 128): #if we've reached the end of an epoch
+  convertedSample = np.array(sample.channels_data[0:2]) * uVoltsConv #convert sample packet data from byte values to units of microvolts. we only care about PFC for attention, which is why we're only taking fp1 and fp2 readings
+
+  allSamples.append(convertedSample) #for plotting
+
+  #we need to segment into epochs to complete intensity vs time data, apply filters, and then extract features
+
+  #epoch segmentation - for smooth throttle control, we need around 1 Hz updates at least, so roughly 1000 ms long epochs. Because our Cyton's 
+  #sampling rate is 250 Hz, we get 1 sample every 4 ms. 1024 is a nice number near 1000 divisible by 4, so we can use 1024 ms as our epoch length.
+  #this gives us 256 samples per epoch (1024 ms / 4 ms per 1 sample).
+  if (samplesInEpoch == samplesPerEpoch): #if we've reached the end of an epoch
     epochChannelData = np.array(epochChannelData)
 
-    filteredSignal = applyBandpass(epochChannelData) #apply filters
+    filteredSignal = applyBandpass(epochChannelData)
     cleanedSignal = removeArtifacts(filteredSignal)
 
-    attentionMetric = extractAttention(cleanedSignal) #get attention metric using theta/beta ratio
-    
-    epochChannelData = np.zeros((2, 128))
+    attentionMetric = extractAttention(cleanedSignal)
+
+    smoothed = applyEMA(attentionMetric)
+
+    if (calibrationEpochs <= 118): #if currently in calibration, execute calibration code
+      epochChannelData = np.zeros((2, samplesPerEpoch))
+      samplesInEpoch = 0
+      calibrateRange(smoothed)
+      return
+
+    smoothed = ((smoothed - baseline) / (capacity - baseline + 1e-10)) * 100 #fit smoothed bandpower values to our calibrated range, normalizing between 1 and 100
+    smoothed = max(0, min(smoothed, 100)) #constrain to valid values, 1-100 normalized range
+    if (smoothed < 10):
+      smoothed = 0 #set a reasonable resting buffer
+    else:
+      smoothed -= 5 #correct rest of values down
+
+    lastThrottle = smoothed
+
+    epochChannelData = np.zeros((2, samplesPerEpoch))
     samplesInEpoch = 0
-    esp.write(f"{attentionMetric:.0f}\n".encode()) #write attention metric to ESP
-    print(attentionMetric)
+    esp.write(f"S{lastSteering:02.0f}T{lastThrottle:03.0f}\n".encode()) #write attention metric to ESP
+    print(smoothed)
   
   epochChannelData[:, samplesInEpoch] = convertedSample
   samplesInEpoch += 1
-
-#variables to play with:
-  #window - rectangular, hamming, hanning, bartlett, etc
-  #artifact removal
-  #feature extraction
-def driveCar(sample):
-  handleSteering(sample)
-  throttle(sample)
 
 def applyBandpass(signal):
   signal = np.asarray(signal) #convert to ndarray if needed
@@ -94,39 +171,55 @@ def removeArtifacts(signal):
 
 def extractAttention(signal):
   global sampleFreq
-  thetaMin, thetaMax = 4, 8 #define frequency ranges for theta and beta bands
-  betaMin, betaMax = 12, 40
+  global samplesPerEpoch
+  betaMin, betaMax = 12, 15
 
   #welch's method is a super powerful way of computing a power spectral density. the function applies an FFT to convert to the spectral domain,
   #then estimates PSD by dividing the data into overlapping segments and averaging the periodograms to yield a numerically stable and accurate result
-  freqsExtracted, transformedPSD = welch(signal, fs=sampleFreq, window='hann', nperseg=128, noverlap=64, axis=1)
+  freqsExtracted, transformedPSD = welch(signal, fs=sampleFreq, window='hann', nperseg=samplesPerEpoch, noverlap=64, axis=1)
 
   #at this point, we have two important arrays post Fourier Transform:
     #transformedPSD is a spectral domain array that conveys PSD vs frequency bin. 
     #freqsExtracted gives us the Hz values for each frequency bin in transformed.
 
-  thetaFreqs = (freqsExtracted >= thetaMin) & (freqsExtracted <= thetaMax) #create boolean masks for frequency bin ranges that we care about
   betaFreqs = (freqsExtracted >= betaMin) & (freqsExtracted <= betaMax)
 
   df = freqsExtracted[1] - freqsExtracted[0] #compute unit changes in frequency in our transformedPSD array
 
   #split transformedPSD into 4 arrays, representing beta and theta range for each channel. integrate each over frequency to get total band power
   #because PSD is given in units of power per hertz. 
-  thetaCh1 = np.sum(transformedPSD[0, thetaFreqs]) * df #np.sum integrates when multipled by step size
   betaCh1 = np.sum(transformedPSD[0, betaFreqs]) * df
-  thetaCh2 = np.sum(transformedPSD[1, thetaFreqs]) * df
   betaCh2 = np.sum(transformedPSD[1, betaFreqs]) * df
 
-  thetaBandPower = (thetaCh1 + thetaCh2) / 2 #average band powers across Fp1 and Fp2 channels
   betaBandPower = (betaCh1 + betaCh2) / 2
 
-  epsilon = 1e-10 #need this to safeguard against potential division by 0 errors in cases where beta band power is super small
-  attentionMetricTBR = thetaBandPower / (betaBandPower + epsilon) #final attention metric is a theta/beta ratio, this is justified by extensive research
+  attentionMetric = betaBandPower #final attention metric is raw beta bandpower, this is justified by research & field testing
+  attentionMetric = max(0, min(100, attentionMetric))
 
-  return attentionMetricTBR
+  return attentionMetric 
+
+#we need an exponential moving average to smooth our data --> elucidate general trend of bandpower values rather than getting jerky data
+def applyEMA(currentBeta):
+  global alphaEMA, previous, appliedEMA
+
+  if (appliedEMA < 3): #if first data point, we don't have a previous to work with. we set it, and return the raw data. we also need to delay applying the EMA for the 3 initial skipped epochs.
+    previous = currentBeta
+    appliedEMA += 1
+    return currentBeta
+  
+  #applying some empirically-determined scalar alpha to the next piece of data, then adding the product of the scalar's complement and the previous smoothed data
+  smoothed = (alphaEMA * currentBeta) + ((1 - alphaEMA) * previous)
+  previous = smoothed
+
+  return smoothed
+
+#MAIN - CALL ALL FUNCTIONS
+def driveCar(sample):
+  handleSteering(sample)
+  throttle(sample)
 
 try:
-  board.start_stream(driveCar)
+  calibrateRange(0)
 
 except KeyboardInterrupt:
   print("\nStopping stream...")
