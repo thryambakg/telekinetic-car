@@ -34,6 +34,12 @@ calibrationEpochs = 0
 #writing
 lastSteering = 0
 lastThrottle = 0
+reverseTrue = -1
+
+#handle deceleration
+pastVals = [0, 0, 0]
+lastDecelValue = 500
+curPos = 0
 
 allSamples = []
 
@@ -50,7 +56,7 @@ BANDPASS_SOS = butter(
 )
 
 board = OpenBCICyton(port=CYTON_PORT, daisy=False, baud=115200, timeout=None, max_packets_skipped=1) #initialize boards
-esp = serial.Serial(port=ESP_PORT)
+esp = serial.Serial(port=ESP_PORT, timeout=0.01)
 time.sleep(2)
 
 def calibrateRange(currentAttention):
@@ -117,7 +123,7 @@ def throttle(sample):
   global allSamples
   global samplesInEpoch, epochChannelData, samplesPerEpoch
   global calibrationEpochs, baseline, capacity
-  global lastSteering, lastThrottle
+  global lastSteering, lastThrottle, reverseTrue
 
   convertedSample = np.array(sample.channels_data[0:2]) * uVoltsConv #convert sample packet data from byte values to units of microvolts. we only care about PFC for attention, which is why we're only taking fp1 and fp2 readings
 
@@ -151,12 +157,14 @@ def throttle(sample):
     else:
       smoothed -= 5 #correct rest of values down
 
-    lastThrottle = smoothed
+    decelCorrected = upscaleDecel(smoothed)
+
+    lastThrottle = decelCorrected * reverseTrue #correct for reverse state, handled by user button press
 
     epochChannelData = np.zeros((2, samplesPerEpoch))
     samplesInEpoch = 0
-    esp.write(f"S{lastSteering:02.0f}T{lastThrottle:03.0f}\n".encode()) #write attention metric to ESP
-    print(smoothed)
+    esp.write(f"S{lastSteering:03.0f}T{lastThrottle:03.0f}\n".encode()) #write attention metric to ESP
+    print(decelCorrected)
   
   epochChannelData[:, samplesInEpoch] = convertedSample
   samplesInEpoch += 1
@@ -213,16 +221,71 @@ def applyEMA(currentBeta):
 
   return smoothed
 
-#MAIN - CALL ALL FUNCTIONS
+#natural neurological state tends towards activity/focus. therefore, the rate at which humans can unfocus is drastically slower than the rate at which we can focus, hence the need for this function.
+def upscaleDecel(currentAttention):
+  global pastVals, curPos, lastDecelValue
+  result = currentAttention
+  pastVals[curPos] = currentAttention #update our circular queue
+
+  oldestPos = curPos + 1 #handle index updating for circular queue
+  if (oldestPos > 2):
+    oldestPos = 0
+  prevPos = curPos - 1
+  if (prevPos < 0):
+    prevPos = 2
+
+  if (pastVals[curPos] < pastVals[oldestPos] - 3): #exponentially decelerate car if attempt to relax is evident
+    if (lastDecelValue == 500):
+      result = result / 2
+    else:
+      result = lastDecelValue / 2
+    lastDecelValue = result
+  else: #gradually increase throttle back to normal if attempt to relax has vanished
+    if (result > lastDecelValue):
+      lastDecelValue *= 1.5
+      result = lastDecelValue
+    else: 
+      lastDecelValue = 500
+
+  curPos += 1 #handle index updating for circular queue
+  if (curPos > 2):
+    curPos = 0
+  
+  return result #return updated value
+
+def handleButtons():
+  global reverseTrue, calibrationEpochs
+
+  btnPressed = esp.readline().decode().strip()  #read a line from serial
+  if btnPressed:  #ignore empty reads
+    if not btnPressed.startswith("EVT_BIN"): #EVT_BIN marks all button Serial inputs. any line that does not start with EVT_BIN is garbage to be ignored
+      return
+    
+    if (btnPressed == "EVT_BTN1"): #button 1 is pin 25, which will be our reverse direction button
+      print("direction toggled")
+      reverseTrue *= -1
+    elif (btnPressed == "EVT_BTN2"): #button 2 - pin 26, shut down
+      print("emergency shutdown called")
+      raise KeyboardInterrupt
+    elif (btnPressed == "EVT_BTN3"): #button 3 - pin 27, fast forward calibration
+      print("skip to next calibration state")
+      if (calibrationEpochs < 63):
+        calibrationEpochs = 63
+      elif (calibrationEpochs < 118):
+        calibrationEpochs = 118
+
+#MAIN CALLBACK - CALL ALL FUNCTIONS
 def driveCar(sample):
   handleSteering(sample)
   throttle(sample)
+  handleButtons()
 
 try:
   calibrateRange(0)
 
 except KeyboardInterrupt:
   print("\nStopping stream...")
+  esp.write(f"S000T000\n".encode()) #write neutral command to ESP
   board.stop_stream()
   esp.close()
   print("Stream stopped cleanly.")
